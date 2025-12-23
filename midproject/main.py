@@ -40,6 +40,7 @@ env.reset()
 done = {"player_0": False, "player_1": False}
 for agent in env.agent_iter():
     observation, reward, termination, truncation, info = env.last()
+
     current_agent = agent_0 if agent == "player_0" else agent_1
 
     if termination or truncation:
@@ -49,14 +50,10 @@ for agent in env.agent_iter():
         else:
             done["player_1"] = reward
     else:
-        mask = observation["action_mask"]
-        observation_flat = observation["observation"].flatten()
-        
-        action = current_agent.act(observation_flat)
+
+        action = current_agent.act(observation)
 
         # 確保動作是合法的
-        if mask[action] == 0:
-            action = np.random.choice(np.where(mask == 1)[0])
 
     env.step(action)
 
