@@ -95,29 +95,33 @@ class SharedDQN:
         self,
         state_dim: int,
         action_dim: int,
-        lr: float = 1e-3,
+        lr: float = 1e-4,
         gamma: float = 0.99,
         epsilon: float = 1.0,
-        epsilon_decay: float = 0.995,
-        epsilon_min: float = 0.01,
-        batch_size: int = 64,
+        epsilon_final: float = 0.01,
+        exploration_fraction: float = 0.1,
+        total_timesteps: int = 500_000,
+        batch_size: int = 32,
         target_update_freq: int = 1000,
+        buffer_size: int = 100_000,
     ):
         self.action_dim = action_dim
         self.gamma = gamma
         self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
+        self.epsilon_final = epsilon_final
+        self.exploration_fraction = exploration_fraction
+        self.total_timesteps = total_timesteps
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
         self.learn_step = 0
+        self.global_step = 0
 
         self.local_net = QNetwork(state_dim, action_dim).to(DEVICE)
         self.target_net = QNetwork(state_dim, action_dim).to(DEVICE)
         self.target_net.load_state_dict(self.local_net.state_dict())
 
         self.optimizer = optim.Adam(self.local_net.parameters(), lr=lr)
-        self.replay_buffer = ReplayBuffer(capacity=10_000)
+        self.replay_buffer = ReplayBuffer(capacity=buffer_size)
         self.scaler = GradScaler(enabled=DEVICE.type == "cuda")
 
     def _q_values(self, net: nn.Module, state: np.ndarray, action_mask: Optional[np.ndarray]) -> torch.Tensor:
@@ -144,13 +148,24 @@ class SharedDQN:
             action = int(torch.argmax(q_values, dim=1).item())
         return action
 
-    def select_action_opponent(self, state: np.ndarray, action_mask: Optional[np.ndarray], opponent_net: nn.Module) -> int:
+    def select_action_opponent(
+        self,
+        state: np.ndarray,
+        action_mask: Optional[np.ndarray],
+        opponent_net: nn.Module,
+        epsilon_opponent: float = 0.05,
+    ) -> int:
         """
-        對手：使用歷史快照網路，採用 greedy（可自行調整為低 epsilon）。
+        對手：使用歷史快照網路，帶小 epsilon 讓策略共進。
         """
+        if np.random.rand() < epsilon_opponent:
+            if action_mask is not None:
+                valid_actions = np.nonzero(action_mask)[0]
+                if len(valid_actions) > 0:
+                    return int(np.random.choice(valid_actions))
+            return random.randrange(self.action_dim)
         q_values = self._q_values(opponent_net, state, action_mask)
-        action = int(torch.argmax(q_values, dim=1).item())
-        return action
+        return int(torch.argmax(q_values, dim=1).item())
 
     def store(self, state, action, reward, next_state, done):
         self.replay_buffer.add(state, action, reward, next_state, done)
@@ -197,25 +212,35 @@ class SharedDQN:
         return loss.item()
 
     def decay_epsilon(self):
-        self.epsilon = max(self.epsilon * self.epsilon_decay, self.epsilon_min)
+        # 線性衰減，到達 exploration_fraction * total_timesteps 時落到 epsilon_final
+        decay_steps = max(1, int(self.exploration_fraction * self.total_timesteps))
+        progress = min(1.0, self.global_step / decay_steps)
+        self.epsilon = max(self.epsilon_final, 1.0 - (1.0 - self.epsilon_final) * progress)
 
 
 def train_iql(
-    episodes: int = 1000,           # 縮短驗證用，可依需求調回
-    max_steps: int = 1000,         # 每局最長步數，避免拖太久
-    lr: float = 1e-3,
+    episodes: int = 500_000,           # 上限回合，實際以 total_timesteps 為終止條件
+    max_steps: int = 1500,             # 每局最長步數
+    lr: float = 1e-4,
     gamma: float = 0.99,
     epsilon: float = 1.0,
-    epsilon_decay: float = 0.995,
-    epsilon_min: float = 0.01,
-    batch_size: int = 32,          # 降低批次以提速
-    target_update_freq: int = 2000,# 硬更新頻率調大以減少同步成本
+    epsilon_final: float = 0.01,
+    exploration_fraction: float = 0.1,
+    total_timesteps: int = 500_000,
+    batch_size: int = 32,
+    target_update_freq: int = 1000,
+    buffer_size: int = 100_000,
+    learning_starts: int = 100_000,
+    train_freq: int = 4,
+    gradient_steps: int = 1,
     save_dir: str = "checkpoints",
-    snapshot_every: int = 200,     # 快照頻率調大，減少對手更新成本
+    snapshot_every: int = 100,
     max_snapshots: int = 5,
-    early_stop_patience: int = 50, # 連續回合數門檻
-    early_stop_target: float = 15.0, # 最近 patience 回合平均獎勵達標則早停
-    stagnant_limit: int = 500,     # 單局若獎勵長期低迷可提前結束
+    early_stop_patience: int = 50,
+    early_stop_target: float = 15.0,
+    stagnant_limit: int = 500,
+    opponent_epsilon: float = 0.05,
+    opponent_refresh_every: int = 200,
 ):
     """
     訓練主程式：建立 parallel_env，使用共享網路 + 歷史對戰 (self-play)。
@@ -236,10 +261,12 @@ def train_iql(
         lr=lr,
         gamma=gamma,
         epsilon=epsilon,
-        epsilon_decay=epsilon_decay,
-        epsilon_min=epsilon_min,
+        epsilon_final=epsilon_final,
+        exploration_fraction=exploration_fraction,
+        total_timesteps=total_timesteps,
         batch_size=batch_size,
         target_update_freq=target_update_freq,
+        buffer_size=buffer_size,
     )
     opponent_pool = [shared_agent.snapshot()]  # 初始對手快照
 
@@ -251,6 +278,7 @@ def train_iql(
 
     progress = tqdm(range(1, episodes + 1), desc="訓練進度", ascii=True)
 
+    total_steps = 0
     for episode in progress:
         raw_obs, _ = env.reset()
         states = {}
@@ -268,7 +296,10 @@ def train_iql(
             )
             opponent_net = random.choice(opponent_pool)
             actions[agent_names[1]] = shared_agent.select_action_opponent(
-                states[agent_names[1]], masks[agent_names[1]], opponent_net
+                states[agent_names[1]],
+                masks[agent_names[1]],
+                opponent_net,
+                epsilon_opponent=opponent_epsilon,
             )
 
             next_raw_obs, rewards, terminations, truncations, infos = env.step(actions)
@@ -286,13 +317,23 @@ def train_iql(
                 done = dones[name]
                 next_state = next_states[name] if not done else np.zeros_like(states[name])
                 shared_agent.store(states[name], actions[name], reward, next_state, float(done))
-            shared_agent.learn()
+            # 僅在 buffer 累積足夠且符合 train_freq 時執行學習
+            if len(shared_agent.replay_buffer) >= learning_starts and (shared_agent.global_step % train_freq == 0):
+                for _ in range(gradient_steps):
+                    shared_agent.learn()
 
             ep_rewards[agent_names[0]] += rewards[agent_names[0]]
             ep_rewards[agent_names[1]] += rewards[agent_names[1]]
 
             states = next_states
             masks = next_masks
+
+            shared_agent.global_step += 1
+            total_steps += 1
+            shared_agent.decay_epsilon()
+
+            if total_steps >= total_timesteps:
+                break
 
             # 若單局獎勵長期低迷則提前結束該局，避免無效對局拖時間
             if (
@@ -302,11 +343,8 @@ def train_iql(
             ):
                 break
 
-            if all(dones.values()):
+            if all(dones.values()) or total_steps >= total_timesteps:
                 break
-
-        # 每回合結束後衰減 epsilon
-        shared_agent.decay_epsilon()
 
         rewards_history_0.append(ep_rewards[agent_names[0]])
         rewards_history_1.append(ep_rewards[agent_names[1]])
@@ -318,11 +356,13 @@ def train_iql(
             r1=f"{ep_rewards[agent_names[1]]:.2f}",
         )
 
-        # 週期性加入歷史對手快照，維持池上限
+        # 週期性加入最新快照，並適度刷新對手池避免過舊
         if episode % snapshot_every == 0:
             opponent_pool.append(shared_agent.snapshot())
             if len(opponent_pool) > max_snapshots:
                 opponent_pool.pop(0)
+        if episode % opponent_refresh_every == 0:
+            opponent_pool = [shared_agent.snapshot()]
 
         if episode % 100 == 0:
             avg_r0 = np.mean(rewards_history_0[-100:])
