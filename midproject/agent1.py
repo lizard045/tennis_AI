@@ -1,28 +1,71 @@
 import torch
-import numpy as np
 import torch.nn as nn
-#請將模型2導入至本檔案
+import numpy as np
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-#代理主區塊
+class QNetwork(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class Agent:
-    def __init__(self, state_dim, action_dim):
-        pass
-    #動作決擇
+    def __init__(self, state_dim: int, action_dim: int, weight_path: str):
+        self.model = QNetwork(state_dim, action_dim).to(DEVICE)
+        self.model.load_state_dict(torch.load(weight_path, map_location=DEVICE))
+        self.model.eval()
+        self.meanings = [
+            "NOOP", "FIRE", "UP", "RIGHT", "LEFT", "DOWN",
+            "UPRIGHT", "UPLEFT", "DOWNRIGHT", "DOWNLEFT",
+            "UPFIRE", "RIGHTFIRE", "LEFTFIRE", "DOWNFIRE",
+            "UPRIGHTFIRE", "UPLEFTFIRE", "DOWNRIGHTFIRE", "DOWNLEFTFIRE",
+        ]
 
-    def act(self, state):
-        action = None
-        return action
+    def act(self, obs: np.ndarray, action_mask=None) -> int:
+        state_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.model(state_t)
+            # 無 mask 時，直接以 Q 值 greedy
+            if action_mask is None:
+                return int(torch.argmax(q_values, dim=1).item())
+
+            mask = torch.tensor(action_mask, dtype=torch.bool, device=DEVICE)
+            if not mask.any():
+                return int(torch.argmax(q_values, dim=1).item())
+
+            # 優先 FIRE
+            for idx, name in enumerate(self.meanings):
+                if idx < mask.numel() and mask[idx] and "FIRE" in name:
+                    return int(idx)
+
+            # 次優先：第一個合法且非 NOOP
+            legal = torch.nonzero(mask).flatten()
+            for idx in legal.tolist():
+                if self.meanings[idx] != "NOOP":
+                    return int(idx)
+
+            # 若只剩 NOOP，就回傳 NOOP
+            if len(legal) > 0:
+                return int(legal[0])
+
+            # 最後防呆：遮掉非法後 greedy
+            q_values[0][~mask] = -1e9
+            return int(torch.argmax(q_values, dim=1).item())
+
 
 def load():
-   state_dim = 10800    #根據使用CNN或MLP自行設定 
-   action_dim = 18  # 動作空間
-
-    # 初始化代理
-   agent_1 = Agent(state_dim, action_dim)
-
-    # 載入之前儲存的模型權重
-   agent_1.model.load_state_dict(torch.load("checkpoints/dqn_step_20000.pt"))
-
-    #導出模型2
-   return agent_1
+    state_dim = 128
+    action_dim = 18
+    weight_path = "checkpoints/shared_player_final.pt"
+    return Agent(state_dim, action_dim, weight_path)

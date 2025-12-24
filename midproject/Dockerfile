@@ -40,3 +40,5 @@ ENV DISPLAY=:99
 
 # 預設進入 bash
 CMD ["bash"]
+
+
