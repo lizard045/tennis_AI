@@ -219,14 +219,14 @@ class SharedDQN:
 
 
 def train_iql(
-    episodes: int = 500_000,           # 上限回合，實際以 total_timesteps 為終止條件
-    max_steps: int = 1500,             # 每局最長步數
+    num_envs: int = 4,                 # 並行環境數量
+    max_steps: int = 2000,             # 單環境單局最長步數
     lr: float = 1e-4,
     gamma: float = 0.99,
     epsilon: float = 1.0,
     epsilon_final: float = 0.01,
     exploration_fraction: float = 0.1,
-    total_timesteps: int = 500_000,
+    total_timesteps: int = 1000_000,
     batch_size: int = 32,
     target_update_freq: int = 1000,
     buffer_size: int = 100_000,
@@ -247,11 +247,12 @@ def train_iql(
     - 單一 SharedDQN，同時扮演雙方。
     - 對手來自歷史權重快照池，提升穩定性。
     """
-    env = tennis_v3.parallel_env(obs_type="ram")
-    raw_obs, _ = env.reset(seed=42)
+    envs = [tennis_v3.parallel_env(obs_type="ram") for _ in range(num_envs)]
+    for idx, e in enumerate(envs):
+        e.reset(seed=42 + idx)
 
-    agent_names = env.possible_agents
-    action_dim = env.action_space(agent_names[0]).n
+    agent_names = envs[0].possible_agents
+    action_dim = envs[0].action_space(agent_names[0]).n
     state_dim = 128  # RAM 狀態維度
 
     # 單一共享 DQN，自我對戰
@@ -276,21 +277,35 @@ def train_iql(
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    progress = tqdm(range(1, episodes + 1), desc="訓練進度", ascii=True)
+    progress = tqdm(total=total_timesteps, desc="訓練進度", ascii=True)
 
     total_steps = 0
-    for episode in progress:
-        raw_obs, _ = env.reset()
-        states = {}
-        masks = {}
+    # 初始化每個環境的狀態與回合累積獎勵
+    env_states = []
+    env_masks = []
+    env_ep_rewards = []
+    env_steps = []
+    for e in envs:
+        obs, _ = e.reset()
+        s = {}
+        m = {}
         for name in agent_names:
-            states[name], masks[name] = preprocess_observation(raw_obs[name])
+            s[name], m[name] = preprocess_observation(obs[name])
+        env_states.append(s)
+        env_masks.append(m)
+        env_ep_rewards.append({name: 0.0 for name in agent_names})
+        env_steps.append(0)
 
-        ep_rewards = {name: 0.0 for name in agent_names}
+    while total_steps < total_timesteps:
+        for env_idx, env in enumerate(envs):
+            if total_steps >= total_timesteps:
+                break
 
-        for step in range(max_steps):
+            states = env_states[env_idx]
+            masks = env_masks[env_idx]
+            ep_rewards = env_ep_rewards[env_idx]
+
             actions = {}
-            # 學習者使用當前網路，對手使用歷史快照
             actions[agent_names[0]] = shared_agent.select_action(
                 states[agent_names[0]], masks[agent_names[0]]
             )
@@ -311,68 +326,67 @@ def train_iql(
                 next_states[name], next_masks[name] = preprocess_observation(next_raw_obs[name])
                 dones[name] = terminations[name] or truncations[name]
 
-            # 雙方經驗都餵入共享 buffer
             for name in agent_names:
                 reward = rewards[name]
                 done = dones[name]
                 next_state = next_states[name] if not done else np.zeros_like(states[name])
                 shared_agent.store(states[name], actions[name], reward, next_state, float(done))
-            # 僅在 buffer 累積足夠且符合 train_freq 時執行學習
-            if len(shared_agent.replay_buffer) >= learning_starts and (shared_agent.global_step % train_freq == 0):
+
+            if (
+                len(shared_agent.replay_buffer) >= learning_starts
+                and (shared_agent.global_step % train_freq == 0)
+            ):
                 for _ in range(gradient_steps):
                     shared_agent.learn()
 
             ep_rewards[agent_names[0]] += rewards[agent_names[0]]
             ep_rewards[agent_names[1]] += rewards[agent_names[1]]
 
-            states = next_states
-            masks = next_masks
+            env_states[env_idx] = next_states
+            env_masks[env_idx] = next_masks
 
             shared_agent.global_step += 1
             total_steps += 1
+            progress.update(1)
             shared_agent.decay_epsilon()
+            env_steps[env_idx] += 1
 
-            if total_steps >= total_timesteps:
-                break
-
-            # 若單局獎勵長期低迷則提前結束該局，避免無效對局拖時間
+            # 若單局獎勵長期低迷則提前結束該局
             if (
-                step > stagnant_limit
+                env_steps[env_idx] > stagnant_limit
                 and abs(ep_rewards[agent_names[0]]) < 0.1
                 and abs(ep_rewards[agent_names[1]]) < 0.1
-            ):
-                break
+            ) or all(dones.values()):
+                obs, _ = env.reset()
+                s = {}
+                m = {}
+                for name in agent_names:
+                    s[name], m[name] = preprocess_observation(obs[name])
+                env_states[env_idx] = s
+                env_masks[env_idx] = m
+                env_ep_rewards[env_idx] = {name: 0.0 for name in agent_names}
+                env_steps[env_idx] = 0
+            else:
+                env_ep_rewards[env_idx] = ep_rewards
 
-            if all(dones.values()) or total_steps >= total_timesteps:
-                break
+        # 紀錄最近一次完成的環境獎勵（近似統計）
+        rewards_history_0.append(np.mean([r[agent_names[0]] for r in env_ep_rewards]))
+        rewards_history_1.append(np.mean([r[agent_names[1]] for r in env_ep_rewards]))
 
-        rewards_history_0.append(ep_rewards[agent_names[0]])
-        rewards_history_1.append(ep_rewards[agent_names[1]])
-
-        # 更新進度條後綴
         progress.set_postfix(
             eps=f"{shared_agent.epsilon:.3f}",
-            r0=f"{ep_rewards[agent_names[0]]:.2f}",
-            r1=f"{ep_rewards[agent_names[1]]:.2f}",
+            r0=f"{rewards_history_0[-1]:.2f}",
+            r1=f"{rewards_history_1[-1]:.2f}",
         )
 
         # 週期性加入最新快照，並適度刷新對手池避免過舊
-        if episode % snapshot_every == 0:
+        if shared_agent.global_step % (snapshot_every * num_envs) == 0:
             opponent_pool.append(shared_agent.snapshot())
             if len(opponent_pool) > max_snapshots:
                 opponent_pool.pop(0)
-        if episode % opponent_refresh_every == 0:
+        if shared_agent.global_step % (opponent_refresh_every * num_envs) == 0:
             opponent_pool = [shared_agent.snapshot()]
 
-        if episode % 100 == 0:
-            avg_r0 = np.mean(rewards_history_0[-100:])
-            avg_r1 = np.mean(rewards_history_1[-100:])
-            print(
-                f"Episode {episode}: {agent_names[0]} 最近100回合平均獎勵={avg_r0:.2f}, "
-                f"{agent_names[1]} 最近100回合平均獎勵={avg_r1:.2f}"
-            )
-
-        # 連續 early_stop_patience 回合都達標則提前結束整體訓練
         if len(rewards_history_0) >= early_stop_patience:
             avg0 = np.mean(rewards_history_0[-early_stop_patience:])
             avg1 = np.mean(rewards_history_1[-early_stop_patience:])
