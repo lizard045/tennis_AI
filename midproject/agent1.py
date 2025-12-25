@@ -32,8 +32,13 @@ class Agent:
             "UPRIGHTFIRE", "UPLEFTFIRE", "DOWNRIGHTFIRE", "DOWNLEFTFIRE",
         ]
 
-    def act(self, obs: np.ndarray, action_mask=None) -> int:
-        state_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    def act(self, obs: np.ndarray, action_mask=None, role_indicator: float = 1.0) -> int:
+        """
+        obs: 已正規化的 128 維 RAM；此處會附加角色旗標，輸入網路為 129 維。
+        role_indicator: 上方0.0 / 下方1.0
+        """
+        obs_with_role = np.concatenate([obs, np.array([role_indicator], dtype=np.float32)], axis=0)
+        state_t = torch.tensor(obs_with_role, dtype=torch.float32, device=DEVICE).unsqueeze(0)
         with torch.no_grad():
             q_values = self.model(state_t)
             # 無 mask 時，直接以 Q 值 greedy
@@ -65,7 +70,7 @@ class Agent:
 
 
 def load():
-    state_dim = 128
+    state_dim = 129  # 128 RAM + 1 角色旗標
     action_dim = 18
     weight_path = "checkpoints/shared_player_final.pt"
     return Agent(state_dim, action_dim, weight_path)

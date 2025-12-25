@@ -50,7 +50,9 @@ def main(render_mode="human"):
             done[agent_name] = reward
         else:
             obs_vec, mask = preprocess(observation)
-            action = current_agent.act(obs_vec, mask)
+            # 角色旗標：上方 0.0、下方 1.0
+            role_flag = 0.0 if agent_name == "player_0" else 1.0
+            action = current_agent.act(obs_vec, mask, role_indicator=role_flag)
         env.step(action)
 
     env.close()
