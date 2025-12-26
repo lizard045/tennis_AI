@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
 from pettingzoo.atari import tennis_v3
 from tqdm import tqdm
 
@@ -122,7 +123,8 @@ class SharedDQN:
 
         self.optimizer = optim.Adam(self.local_net.parameters(), lr=lr)
         self.replay_buffer = ReplayBuffer(capacity=buffer_size)
-        self.scaler = GradScaler(enabled=DEVICE.type == "cuda")
+        # 新版 AMP API
+        self.scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
 
     def _q_values(self, net: nn.Module, state: np.ndarray, action_mask: Optional[np.ndarray]) -> torch.Tensor:
         state_t = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
@@ -133,9 +135,9 @@ class SharedDQN:
             q_values[0][invalid] = -1e9
         return q_values
 
-    def select_action(self, state: np.ndarray, action_mask: Optional[np.ndarray]) -> int:
+    def select_action(self, state: np.ndarray, action_mask: Optional[np.ndarray], role_indicator: float = 0.0) -> int:
         """
-        學習者：epsilon-greedy。
+        學習者：epsilon-greedy。state 已含角色旗標。
         """
         if np.random.rand() < self.epsilon:
             if action_mask is not None:
@@ -154,9 +156,10 @@ class SharedDQN:
         action_mask: Optional[np.ndarray],
         opponent_net: nn.Module,
         epsilon_opponent: float = 0.05,
+        role_indicator: float = 1.0,
     ) -> int:
         """
-        對手：使用歷史快照網路，帶小 epsilon 讓策略共進。
+        對手：使用歷史快照網路，帶小 epsilon 讓策略共進。state 已含角色旗標。
         """
         if np.random.rand() < epsilon_opponent:
             if action_mask is not None:
@@ -192,7 +195,7 @@ class SharedDQN:
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
 
         # Q(s, a)
-        with autocast(enabled=DEVICE.type == "cuda"):
+        with torch.amp.autocast(device_type="cuda", enabled=DEVICE.type == "cuda"):
             q_values = self.local_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
             with torch.no_grad():
                 max_next_q = self.target_net(next_states).max(dim=1)[0]
@@ -220,13 +223,13 @@ class SharedDQN:
 
 def train_iql(
     num_envs: int = 4,                 # 並行環境數量
-    max_steps: int = 2000,             # 單環境單局最長步數
+    max_steps: int = 4000,             # 單環境單局最長步數，拉長來回球
     lr: float = 1e-4,
     gamma: float = 0.99,
     epsilon: float = 1.0,
     epsilon_final: float = 0.01,
     exploration_fraction: float = 0.1,
-    total_timesteps: int = 1000_000,
+    total_timesteps: int = 1000_0000,
     batch_size: int = 32,
     target_update_freq: int = 1000,
     buffer_size: int = 100_000,
@@ -238,9 +241,11 @@ def train_iql(
     max_snapshots: int = 5,
     early_stop_patience: int = 50,
     early_stop_target: float = 15.0,
-    stagnant_limit: int = 500,
-    opponent_epsilon: float = 0.05,
+    stagnant_limit: int = 2000,        # 放寬提早結束，避免太快重置
+    opponent_epsilon: float = 0.10,    # 對手探索提升
     opponent_refresh_every: int = 200,
+    eval_every: int = 50_000,
+    log_dir: str = "runs/iql_tensorboard",
 ):
     """
     訓練主程式：建立 parallel_env，使用共享網路 + 歷史對戰 (self-play)。
@@ -253,7 +258,7 @@ def train_iql(
 
     agent_names = envs[0].possible_agents
     action_dim = envs[0].action_space(agent_names[0]).n
-    state_dim = 128  # RAM 狀態維度
+    state_dim = 129  # RAM 狀態維度 + 角色旗標
 
     # 單一共享 DQN，自我對戰
     shared_agent = SharedDQN(
@@ -270,6 +275,7 @@ def train_iql(
         buffer_size=buffer_size,
     )
     opponent_pool = [shared_agent.snapshot()]  # 初始對手快照
+    best_opponent = shared_agent.snapshot()    # 保留最強對手（此處簡化為當前）
 
     rewards_history_0 = []
     rewards_history_1 = []
@@ -278,6 +284,7 @@ def train_iql(
     save_path.mkdir(parents=True, exist_ok=True)
 
     progress = tqdm(total=total_timesteps, desc="訓練進度", ascii=True)
+    writer = SummaryWriter(log_dir)
 
     total_steps = 0
     # 初始化每個環境的狀態與回合累積獎勵
@@ -289,8 +296,10 @@ def train_iql(
         obs, _ = e.reset()
         s = {}
         m = {}
-        for name in agent_names:
-            s[name], m[name] = preprocess_observation(obs[name])
+        for idx, name in enumerate(agent_names):
+            base_state, m[name] = preprocess_observation(obs[name])
+            role_flag = 0.0 if idx == 0 else 1.0
+            s[name] = np.concatenate([base_state, np.array([role_flag], dtype=np.float32)], axis=0)
         env_states.append(s)
         env_masks.append(m)
         env_ep_rewards.append({name: 0.0 for name in agent_names})
@@ -306,15 +315,21 @@ def train_iql(
             ep_rewards = env_ep_rewards[env_idx]
 
             actions = {}
+            # 角色指示：假設 agent_names[0] 是上方，agent_names[1] 是下方
             actions[agent_names[0]] = shared_agent.select_action(
-                states[agent_names[0]], masks[agent_names[0]]
+                states[agent_names[0]], masks[agent_names[0]], role_indicator=0.0
             )
-            opponent_net = random.choice(opponent_pool)
+            # 使用最強對手 + 隨機歷史對手混合，提升對抗性
+            if random.random() < 0.5:
+                opponent_net = best_opponent
+            else:
+                opponent_net = random.choice(opponent_pool)
             actions[agent_names[1]] = shared_agent.select_action_opponent(
                 states[agent_names[1]],
                 masks[agent_names[1]],
                 opponent_net,
                 epsilon_opponent=opponent_epsilon,
+                role_indicator=1.0,
             )
 
             next_raw_obs, rewards, terminations, truncations, infos = env.step(actions)
@@ -322,8 +337,10 @@ def train_iql(
             next_states = {}
             next_masks = {}
             dones = {}
-            for name in agent_names:
-                next_states[name], next_masks[name] = preprocess_observation(next_raw_obs[name])
+            for idx, name in enumerate(agent_names):
+                base_next, next_masks[name] = preprocess_observation(next_raw_obs[name])
+                role_flag = 0.0 if idx == 0 else 1.0
+                next_states[name] = np.concatenate([base_next, np.array([role_flag], dtype=np.float32)], axis=0)
                 dones[name] = terminations[name] or truncations[name]
 
             for name in agent_names:
@@ -360,8 +377,10 @@ def train_iql(
                 obs, _ = env.reset()
                 s = {}
                 m = {}
-                for name in agent_names:
-                    s[name], m[name] = preprocess_observation(obs[name])
+                for idx, name in enumerate(agent_names):
+                    base_state, m[name] = preprocess_observation(obs[name])
+                    role_flag = 0.0 if idx == 0 else 1.0
+                    s[name] = np.concatenate([base_state, np.array([role_flag], dtype=np.float32)], axis=0)
                 env_states[env_idx] = s
                 env_masks[env_idx] = m
                 env_ep_rewards[env_idx] = {name: 0.0 for name in agent_names}
@@ -378,14 +397,20 @@ def train_iql(
             r0=f"{rewards_history_0[-1]:.2f}",
             r1=f"{rewards_history_1[-1]:.2f}",
         )
+        writer.add_scalar("train/epsilon", shared_agent.epsilon, shared_agent.global_step)
+        writer.add_scalar("train/reward_agent0", rewards_history_0[-1], shared_agent.global_step)
+        writer.add_scalar("train/reward_agent1", rewards_history_1[-1], shared_agent.global_step)
 
-        # 週期性加入最新快照，並適度刷新對手池避免過舊
+        # 週期性加入最新快照；保留池中最強（簡化：以最近 reward 近似）
         if shared_agent.global_step % (snapshot_every * num_envs) == 0:
             opponent_pool.append(shared_agent.snapshot())
+            # 過滿則移除最弱：這裡簡化為 FIFO，亦可改為保留最近或評分最高
             if len(opponent_pool) > max_snapshots:
                 opponent_pool.pop(0)
         if shared_agent.global_step % (opponent_refresh_every * num_envs) == 0:
-            opponent_pool = [shared_agent.snapshot()]
+            # 取當前模型作為最強對手
+            best_opponent = shared_agent.snapshot()
+            opponent_pool = [best_opponent]
 
         if len(rewards_history_0) >= early_stop_patience:
             avg0 = np.mean(rewards_history_0[-early_stop_patience:])
@@ -398,7 +423,9 @@ def train_iql(
                 break
 
     progress.close()
-    env.close()
+    writer.close()
+    for env in envs:
+        env.close()
     # 儲存最終權重
     torch.save(shared_agent.local_net.state_dict(), save_path / "shared_player_final.pt")
     print(f"訓練完成，權重已儲存至 {save_path.resolve()}")
