@@ -4,7 +4,7 @@
 
 ## 對戰畫面預覽
 
-![Tennis 對戰畫面](tennis.png)
+![Tennis 對戰畫面](https://raw.githubusercontent.com/lizard045/tennis_AI/main/midproject/tennis.png)
 
 上方球員（`first_0`）與下方球員（`second_0`）分別由不同模型權重控制，透過 `main.py` 進行即時對打。
 
